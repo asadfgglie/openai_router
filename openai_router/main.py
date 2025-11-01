@@ -155,19 +155,27 @@ async def _non_stream_proxy(backend_url: str, request: Request, json_body: dict)
         raise HTTPException(status_code=500, detail=f"Internal proxy error: {e}")
 
 
+@app.post("/v1/responses", summary="/v1/responses ")
 @app.post("/v1/completions", summary="/v1/completions")
 @app.post("/v1/chat/completions", summary="/v1/chat/completions")
-async def post_completions(request: Request):
+@app.post("/v1/embeddings", summary="/v1/embeddings")
+@app.post("/v1/moderations", summary="/v1/moderations")
+@app.post("/v1/images/generations", summary="/v1/images/generations")
+@app.post("/v1/images/edits", summary="/v1/images/edits")
+@app.post("/v1/images/variations", summary="/v1/images/variations")
+@app.post("/v1/audio/transcriptions", summary="/v1/audio/transcriptions")
+@app.post("/v1/audio/speech", summary="/v1/audio/speech")
+@app.post("/v1/rerank", summary="/v1/rerank")
+async def router(request: Request):
     backend_url, json_body = await _get_routing_info(request)
-
+    # 流式接口
     if json_body.get("stream", False):
-        logger.info("Handling as STREAMING request")
         return StreamingResponse(
             _stream_proxy(backend_url, request, json_body),
             media_type="text/event-stream",
         )
+    # 非流式接口
     else:
-        logger.info("Handling as NON-STREAMING request")
         return await _non_stream_proxy(backend_url, request, json_body)
 
 
@@ -176,7 +184,7 @@ if __name__ == "__main__":
 
     # 你需要通过环境变量来设置模型，例如：
     # MODELS="gpt-4=http://localhost:8080,llama=http://localhost:8081" uvicorn streaming_proxy:app --host 0.0.0.0 --port 8000
-    os.environ["MODELS"] = "qwen3=https://miyun.archermind.com"
+    os.environ["MODELS"] = "Conan-embedding-v1=https://miyun.archermind.com"
     if not os.environ.get("MODELS"):
         logger.warning(
             "MODELS environment variable is not set. Example: MODELS='model_name=http://backend_url'"
