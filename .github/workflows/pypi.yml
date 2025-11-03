@@ -1,0 +1,39 @@
+name: Build & Release to PyPI
+
+on:
+  push:
+    tags:
+    - 'v*.*.*' # 仅当推送形如 v0.1.0 的标签时触发 
+# 配置 OIDC 权限
+permissions:
+  id-token: write # 允许 runner 获取 OIDC 令牌
+  contents: read  # 允许读取仓库内容
+
+jobs:
+  build-and-publish:
+    name: Build wheel & upload to PyPI
+    runs-on: ubuntu-latest
+
+    environment:
+      name: pypi 
+      url: https://pypi.org/p/openai-router  
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v3
+      with:
+        version: latest
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11' # 与 pyproject.toml  保持一致 
+
+    - name: Build package
+      run: uv build --wheel
+
+    - name: Publish to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
