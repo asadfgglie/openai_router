@@ -25,7 +25,7 @@
 | 🌍 统一入口    | `/chat/completions`、`/embeddings`、`/images/generations`… 全部转发       |
 | 🧩 多后端      | vLLM、SGLang、lmdeploy、Ollama… 任意组合                                  |
 | 💾 持久化      | SQLite + SQLModel 零配置存储路由                                          |
-| ⚡ 实时流      | SSE & Chunked Transfer 全双工支持                                         |
+| ⚡ 负载均衡      |  可配置多个同名模型，自动进行轮询式负载均衡（暂不支持异常踢出机制）                                        |
 | 🎨 Web UI      | Gradio 即用的管理面板                                                     |
 | 🔍 兼容 OpenAI | SDK / LangChain / AutoGen / LlamaIndex / CrewAI  …等 **一行代码都不用改** |
  
