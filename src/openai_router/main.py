@@ -164,11 +164,11 @@ def get_routing_info_sync(model: str) -> tuple[Optional[str], Sequence[str], Opt
 def get_default_model_route_info_sync(path: str) -> tuple[Optional[str], Sequence[str], Optional[str], Optional[str]]:
     """同步地从数据库中查询默认模型路由信息"""
     with Session(engine) as session:
-        statement = select(DefaultRoute).where(DefaultRoute.route == path)
-        route = session.exec(statement).first()
+        statement = select(DefaultRoute.default_model).where(DefaultRoute.route == path)
+        model: Optional[str] = session.exec(statement).first()
 
-        if route:
-            return get_routing_info_sync(route.default_model) + (route.default_model,)
+        if model:
+            return get_routing_info_sync(model) + (model,)
         else:
             return None, get_all_model_names_sync(), None, None
 
