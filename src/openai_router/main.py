@@ -2,8 +2,9 @@ import threading
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Optional, Sequence, Literal
+from typing import Annotated, Optional, Sequence
 
 import gradio as gr
 import httpx
@@ -58,14 +59,26 @@ class ModelRoute(SQLModel, table=True):
         default_factory=lambda: datetime.now(timezone.utc), nullable=False
     )
 
+
+class RoutePath(StrEnum):
+    COMPLETIONS = "/v1/completions"
+    CHAT_COMPLETIONS = "/v1/chat/completions"
+    EMBEDDINGS = "/v1/embeddings"
+    IMAGES_GENERATIONS = "/v1/images/generations"
+    IMAGES_EDITS = "/v1/images/edits"
+    IMAGES_VARIATIONS = "/v1/images/variations"
+    AUDIO_TRANSCRIPTIONS = "/v1/audio/transcriptions"
+    AUDIO_TRANSLATIONS = "/v1/audio/translations"
+    RERANK = "/v1/rerank"
+    TOKENIZE = "/tokenize"
+    DETOKENIZE = "/detokenize"
+
+
 class DefaultRoute(SQLModel, table=True):
     """
     a SQLModel for staring default model of route
     """
-    route: Literal["/v1/completions", '/v1/chat/completions', "/v1/embeddings",
-                   "/v1/images/generations", "/v1/images/edits", "/v1/images/variations",
-                   "/v1/audio/transcriptions","/v1/audio/translations", "/v1/rerank",
-                   '/tokenize', '/detokenize'] = Field(primary_key=True)
+    route: RoutePath = Field(primary_key=True, index=True)
     default_model: str
 
 
@@ -148,16 +161,16 @@ def get_routing_info_sync(model: str) -> tuple[Optional[str], Sequence[str], Opt
 
         return server, available_models, backend_api_key
 
-def get_default_model_route_info_sync(path: str) -> tuple[Optional[str], Sequence[str], Optional[str]]:
+def get_default_model_route_info_sync(path: str) -> tuple[Optional[str], Sequence[str], Optional[str], Optional[str]]:
     """同步地从数据库中查询默认模型路由信息"""
     with Session(engine) as session:
         statement = select(DefaultRoute).where(DefaultRoute.route == path)
         route = session.exec(statement).first()
 
         if route:
-            return get_routing_info_sync(route.default_model)
+            return get_routing_info_sync(route.default_model) + (route.default_model,)
         else:
-            return None, get_all_model_names_sync(), None
+            return None, get_all_model_names_sync(), None, None
 
 # --- FastAPI 生命周期 ---
 
@@ -174,27 +187,44 @@ async def lifespan(_: FastAPI):
 
     # 1. 初始化数据库引擎 (同步)
     temp_engine = create_engine(SQLITE_URL, echo=False)
+
+    models_to_check = [ModelRoute, DefaultRoute]
     # ---------- 检查数据库 schema 是否与 SQLModel 定义匹配 ----------
     try:
         # 1. 获取 Inspector
         inspector = inspect(temp_engine)
 
-        # 2. 获取数据库中 'modelroute' 表的实际列
-        # 如果表不存在，这将触发 OperationalError，并被 catch 块捕获
-        actual_columns_info = inspector.get_columns(ModelRoute.__tablename__)
-        actual_columns = {col["name"] for col in actual_columns_info}
+        schema_mismatch = False
 
-        # 3. 获取 SQLModel 中定义的预期列
-        expected_columns = {col.name for col in ModelRoute.__table__.columns}
+        for model in models_to_check:
+            table_name = model.__tablename__
 
-        # 4. 比较
-        if actual_columns != expected_columns:
-            logger.warning(
-                f"数据库 Schema 不匹配! 预期: {expected_columns}, 实际: {actual_columns}"
-            )
+            # 使用 has_table 先检查表是否存在，避免直接 get_columns 抛出异常
+            # 这样可以允许部分表存在(旧)，部分表不存在(新加的)的情况
+            if inspector.has_table(table_name):
+                # 2. 获取数据库中表的实际列
+                actual_columns_info = inspector.get_columns(table_name)
+                actual_columns = {col["name"] for col in actual_columns_info}
+
+                # 3. 获取 SQLModel 中定义的预期列
+                expected_columns = {col.name for col in model.__table__.columns}
+
+                # 4. 比较
+                if actual_columns != expected_columns:
+                    logger.warning(
+                        f"数据库表 '{table_name}' Schema 不匹配! \n预期: {expected_columns}\n实际: {actual_columns}"
+                    )
+                    schema_mismatch = True
+                    break # 只要有一个表不对，就触发重置
+            else:
+                # 表不存在，这很正常（可能是新加的功能），不需要删除数据库
+                # 后续的 create_db_and_tables_sync 会自动创建它
+                logger.info(f"表 '{table_name}' 尚未存在，将在后续步骤创建。")
+
+        # 如果发现任何 Schema 不匹配，执行删除重建逻辑
+        if schema_mismatch:
             logger.warning(f"正在删除旧数据库文件: {SQLITE_DB_FILE} 以进行重建...")
 
-            # 必须先 dispose，释放所有连接，然后才能删除文件
             temp_engine.dispose()
 
             try:
@@ -204,12 +234,12 @@ async def lifespan(_: FastAPI):
                 logger.error(
                     f"无法删除数据库文件 {SQLITE_DB_FILE}: {e}. 请手动删除它。"
                 )
-                # 即使删除失败，我们也尝试重新创建引擎
 
-            # 重新创建 engine 实例，以便连接到新文件
+            # 重新创建 engine 实例
             temp_engine = create_engine(SQLITE_URL, echo=False)
 
-    except (OperationalError, DBAPIError) as e:
+
+    except (OperationalError, DBAPIError):
         # 这是预期的“错误”，如果数据库文件或 'modelroute' 表还不存在
         # 我们安全地忽略它，然后继续创建表
         logger.info(f"数据库或表 '{ModelRoute.__tablename__}' 未找到。将创建新表。")
@@ -262,7 +292,7 @@ async def _get_routing_info(request: Request):
     model = json_body.get("model")
 
     if model is None:
-        server, available_models, backend_api_key = await run_in_threadpool(
+        server, available_models, backend_api_key, model = await run_in_threadpool(
             get_default_model_route_info_sync, request.url.path
         )
 
@@ -271,6 +301,9 @@ async def _get_routing_info(request: Request):
                 status_code=400,
                 detail=f"Can't find default model for path {request.url.path}. Available models: {available_models}",
             )
+
+        json_body["model"] = model  # 设置默认模型到请求体中
+        logger.info(f"Using default model '{model}' for path {request.url.path}")
     else:
         # 在线程池中执行同步查询
         server, available_models, backend_api_key = await run_in_threadpool(
@@ -416,17 +449,17 @@ async def list_models():
         )
 
 
-@app.post("/v1/completions", summary="/v1/completions")
-@app.post("/v1/chat/completions", summary="/v1/chat/completions")
-@app.post("/v1/embeddings", summary="/v1/embeddings")
-@app.post("/v1/images/generations", summary="/v1/images/generations")
-@app.post("/v1/images/edits", summary="/v1/images/edits")
-@app.post("/v1/images/variations", summary="/v1/images/variations")
-@app.post("/v1/audio/transcriptions", summary="/v1/audio/transcriptions")
-@app.post("/v1/audio/translations", summary="/v1/audio/translations")
-@app.post("/v1/rerank", summary="/v1/rerank")
-@app.post('/tokenize', summary='/tokenize')
-@app.post('/detokenize', summary='/detokenize')
+@app.post(RoutePath.COMPLETIONS, summary=RoutePath.COMPLETIONS)
+@app.post(RoutePath.CHAT_COMPLETIONS, summary=RoutePath.CHAT_COMPLETIONS)
+@app.post(RoutePath.EMBEDDINGS, summary=RoutePath.EMBEDDINGS)
+@app.post(RoutePath.IMAGES_GENERATIONS, summary=RoutePath.IMAGES_GENERATIONS)
+@app.post(RoutePath.IMAGES_EDITS, summary=RoutePath.IMAGES_EDITS)
+@app.post(RoutePath.IMAGES_VARIATIONS, summary=RoutePath.IMAGES_VARIATIONS)
+@app.post(RoutePath.AUDIO_TRANSCRIPTIONS, summary=RoutePath.AUDIO_TRANSCRIPTIONS)
+@app.post(RoutePath.AUDIO_TRANSLATIONS, summary=RoutePath.AUDIO_TRANSLATIONS)
+@app.post(RoutePath.RERANK, summary=RoutePath.RERANK)
+@app.post(RoutePath.TOKENIZE, summary=RoutePath.TOKENIZE)
+@app.post(RoutePath.DETOKENIZE, summary=RoutePath.DETOKENIZE)
 async def router(request: Request):
     backend_url, json_body, backend_api_key = await _get_routing_info(request)
     if json_body.get("stream", False):
@@ -451,6 +484,17 @@ def get_current_routes_sync() -> list[tuple[str, str, str]]:
             # 屏蔽 API 密钥，仅显示最后 4 位
             masked_key = f"***{route.api_key[-4:]}" if route.api_key else "N/A (将透传)"
             routes.append((route.model_name, route.model_url, masked_key))
+    return routes
+
+
+def get_current_default_routes_sync() -> list[tuple[str, str]]:
+    """同步获取当前預設路由表"""
+    with Session(engine) as session:
+        statement = select(DefaultRoute)
+        routes_db = session.exec(statement)
+        routes: list[tuple[str, str]] = []
+        for route in routes_db.all():
+            routes.append((route.route, route.default_model))
     return routes
 
 
@@ -487,6 +531,36 @@ def add_or_update_route_sync(model_name: str, model_url: str, api_key: str | Non
     return status_message
 
 
+def add_or_update_default_route_sync(route: str, default_model: str):
+    """同步添加或更新一个預設路由到数据库"""
+    status_message = ""
+
+    with Session(engine) as session:
+        statement = select(DefaultRoute).where(
+            DefaultRoute.route == route
+        )
+        db_route = session.exec(statement).first()  # 使用 .first()
+
+        if db_route:
+            # 2. 如果存在，我们只更新默认模型
+            db_route.default_model = default_model
+            status_message = f"預設路由 '{route}' 的默认模型已更新为 '{default_model}'。"
+        else:
+            # 3. 如果不存在，我们创建一个全新的条目
+            db_route = DefaultRoute(
+                route=route, default_model=default_model
+            )
+            status_message = (
+                f"新預設路由 '{route} -> {default_model}' 已添加。"
+            )
+
+        session.add(db_route)
+        session.commit()
+
+    logger.info(f"[Admin] {status_message}")
+    return status_message
+
+
 def delete_route_sync(model_name: str, model_url: str):  # <--- MODIFIED: 需要 model_url
     """
     同步从数据库删除一个 *特定* 的 (model_name, model_url) 路由。
@@ -512,9 +586,36 @@ def delete_route_sync(model_name: str, model_url: str):  # <--- MODIFIED: 需要
     return status_message
 
 
+def delete_default_route_sync(path: str):
+    """
+    同步从数据库删除一个預設路由。
+    """
+    status_message = ""
+    with Session(engine) as session:
+        statement = select(DefaultRoute).where(
+            DefaultRoute.route == path
+        )
+        db_route = session.exec(statement).first()
+
+        if db_route:
+            session.delete(db_route)
+            session.commit()
+            status_message = f"預設路由 '{path}' 已删除。"
+            logger.info(f"[Admin] Default route deleted: {path}")
+        else:
+            status_message = f"错误: 未找到預設路由 '{path}'。"
+
+    return status_message
+
+
 async def get_current_routes():
     """异步调用同步函数获取当前路由表"""
     return await run_in_threadpool(get_current_routes_sync)
+
+
+async def get_current_default_routes():
+    """异步调用同步函数获取当前預設路由表"""
+    return await run_in_threadpool(get_current_default_routes_sync)
 
 
 async def add_or_update_route(model_name: str, model_url: str, api_key: str | None):
@@ -528,6 +629,17 @@ async def add_or_update_route(model_name: str, model_url: str, api_key: str | No
     return status_message, await get_current_routes()
 
 
+async def add_or_update_default_route(route: str, default_model: str):
+    """异步调用同步函数添加或更新預設路由"""
+    if not route or not default_model:
+        return "路由和預設模型不能为空", await get_current_default_routes()
+
+    status_message = await run_in_threadpool(
+        add_or_update_default_route_sync, route, default_model
+    )
+    return status_message, await get_current_default_routes()
+
+
 async def delete_route(
     model_name: str, model_url: str
 ):  # <--- MODIFIED: 需要 model_url
@@ -537,6 +649,15 @@ async def delete_route(
 
     status_message = await run_in_threadpool(delete_route_sync, model_name, model_url)
     return status_message, await get_current_routes()
+
+
+async def delete_default_route(path: str):
+    """异步调用同步函数删除預設路由"""
+    if not path:
+        return "要删除的路由不能为空", await get_current_default_routes()
+
+    status_message = await run_in_threadpool(delete_default_route_sync, path)
+    return status_message, await get_current_default_routes()
 
 
 def on_select_route(routes_data: pd.DataFrame, evt: gr.SelectData):
@@ -555,6 +676,20 @@ def on_select_route(routes_data: pd.DataFrame, evt: gr.SelectData):
     return model_name, model_url, ""
 
 
+def on_select_default_route(routes_data: pd.DataFrame, evt: gr.SelectData):
+    """
+    Gradio: 当用户点击预设路由表格中的一行时，填充输入框。
+    """
+    if evt.index is None:
+        return "", ""
+
+    selected_row = routes_data.iloc[evt.index[0]]
+    route = selected_row.iloc[0]
+    default_model = selected_row.iloc[1]
+
+    return route, default_model
+
+
 def create_admin_ui():
     """创建 Gradio Blocks 界面"""
     with gr.Blocks(
@@ -568,67 +703,122 @@ def create_admin_ui():
 **注意：** 所有路由配置都持久化到 `routes.db` 数据库中。您需要手动添加初始路由。"""
         )
 
-        with gr.Row():
-            refresh_button = gr.Button("刷新路由列表")
+        with gr.Tab("路由管理"):
+            with gr.Row():
+                refresh_button = gr.Button("刷新路由列表")
 
-        with gr.Row():
-            with gr.Column(scale=2):
-                routes_datagrid = gr.DataFrame(
-                    headers=[
-                        "模型名称 (Model Name)",
-                        "后端 URL (Backend URL)",
-                        "API 密钥 (API Key)",
-                    ],
-                    label="当前路由表 (同一模型可有多个URL)",
-                    row_count=(1, "fixed"),
-                    col_count=(3, "fixed"),
-                    interactive=False,
-                )
-            with gr.Column(scale=1):
-                gr.Markdown("### 管理路由")
-                status_output = gr.Textbox(
-                    label="操作状态",
-                    interactive=False,
-                    value="这里用于显示上一次的操作状态",
-                )
-                model_name_input = gr.Textbox(label="模型名称", value="gpt4")
-                model_url_input = gr.Textbox(
-                    label="后端 URL", value="http://localhost:8082"
-                )
-                api_key_input = gr.Textbox(
-                    label="后端 API 密钥 (可选)",
-                    info="如果提供，路由器将使用此密钥覆盖原始请求中的 Authorization 标头。如果留空，将透传原始请求的密钥。",
-                    type="password",  # 确保密钥在 UI 上被遮罩
-                )
-                with gr.Row():
-                    add_update_button = gr.Button("添加 / 更新")
-                    delete_button = gr.Button(
-                        "删除 (指定URL)",
-                        variant="stop",
+            with gr.Row():
+                with gr.Column(scale=2):
+                    routes_datagrid = gr.DataFrame(
+                        headers=[
+                            "模型名称 (Model Name)",
+                            "后端 URL (Backend URL)",
+                            "API 密钥 (API Key)",
+                        ],
+                        label="当前路由表 (同一模型可有多个URL)",
+                        row_count=(1, "fixed"),
+                        col_count=(3, "fixed"),
+                        interactive=False,
                     )
+                with gr.Column(scale=1):
+                    gr.Markdown("### 管理路由")
+                    status_output = gr.Textbox(
+                        label="操作状态",
+                        interactive=False,
+                        value="这里用于显示上一次的操作状态",
+                    )
+                    model_name_input = gr.Textbox(label="模型名称", value="gpt4")
+                    model_url_input = gr.Textbox(
+                        label="后端 URL", value="http://localhost:8082"
+                    )
+                    api_key_input = gr.Textbox(
+                        label="后端 API 密钥 (可选)",
+                        info="如果提供，路由器将使用此密钥覆盖原始请求中的 Authorization 标头。如果留空，将透传原始请求的密钥。",
+                        type="password",  # 确保密钥在 UI 上被遮罩
+                    )
+                    with gr.Row():
+                        add_update_button = gr.Button("添加 / 更新")
+                        delete_button = gr.Button(
+                            "删除 (指定URL)",
+                            variant="stop",
+                        )
 
-        # --- 绑定 Gradio 事件 ---
-        admin_ui.load(get_current_routes, outputs=routes_datagrid)
-        refresh_button.click(get_current_routes, outputs=routes_datagrid)
+            # --- 绑定 Gradio 事件 ---
+            admin_ui.load(get_current_routes, outputs=routes_datagrid)
+            refresh_button.click(get_current_routes, outputs=routes_datagrid)
 
-        add_update_button.click(
-            add_or_update_route,
-            inputs=[model_name_input, model_url_input, api_key_input],
-            outputs=[status_output, routes_datagrid],
-        )
+            add_update_button.click(
+                add_or_update_route,
+                inputs=[model_name_input, model_url_input, api_key_input],
+                outputs=[status_output, routes_datagrid],
+            )
 
-        delete_button.click(
-            delete_route,
-            inputs=[model_name_input, model_url_input],
-            outputs=[status_output, routes_datagrid],
-        )
+            delete_button.click(
+                delete_route,
+                inputs=[model_name_input, model_url_input],
+                outputs=[status_output, routes_datagrid],
+            )
 
-        routes_datagrid.select(
-            on_select_route,
-            inputs=[routes_datagrid],
-            outputs=[model_name_input, model_url_input, api_key_input],
-        )
+            routes_datagrid.select(
+                on_select_route,
+                inputs=[routes_datagrid],
+                outputs=[model_name_input, model_url_input, api_key_input],
+            )
+        with gr.Tab("預設路由管理"):
+            with gr.Row():
+                refresh_button = gr.Button("刷新路由列表")
 
+            with gr.Row():
+                with gr.Column(scale=2):
+                    routes_datagrid = gr.DataFrame(
+                        headers=[
+                            "路由 (Route)",
+                            "預設模型 (Default Model)",
+                        ],
+                        label="當前預設路由表",
+                        row_count=(1, "fixed"),
+                        col_count=(2, "fixed"),
+                        interactive=False,
+                    )
+                with gr.Column(scale=1):
+                    gr.Markdown("### 管理預設路由")
+                    status_output = gr.Textbox(
+                        label="操作狀態",
+                        interactive=False,
+                        value="這裡用於顯示上一次的操作狀態",
+                    )
+                    route_input = gr.Dropdown(list(RoutePath._value2member_map_.keys()), label="路由", value="/v1/chat/completions")
+                    default_model_input = gr.Textbox(
+                        label="預設模型", value="gpt4"
+                    )
+                    with gr.Row():
+                        add_update_button = gr.Button("添加 / 更新")
+                        delete_button = gr.Button(
+                            "刪除 (指定路由)",
+                            variant="stop",
+                        )
+
+            # --- 绑定 Gradio 事件 ---
+            admin_ui.load(get_current_default_routes, outputs=routes_datagrid)
+            refresh_button.click(get_current_default_routes, outputs=routes_datagrid)
+
+            add_update_button.click(
+                add_or_update_default_route,
+                inputs=[route_input, default_model_input],
+                outputs=[status_output, routes_datagrid],
+            )
+
+            delete_button.click(
+                delete_default_route,
+                inputs=[route_input],
+                outputs=[status_output, routes_datagrid],
+            )
+
+            routes_datagrid.select(
+                on_select_default_route,
+                inputs=[routes_datagrid],
+                outputs=[route_input, default_model_input],
+            )
     return admin_ui
 
 
