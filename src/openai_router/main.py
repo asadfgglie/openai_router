@@ -1,25 +1,23 @@
 import threading
 from collections import defaultdict
-from typing import Annotated, Optional
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import Response, StreamingResponse
-from starlette.concurrency import run_in_threadpool
-import httpx
-from loguru import logger
 from contextlib import asynccontextmanager
-import gradio as gr
-import pandas as pd
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Annotated, Optional, Sequence, Literal
+
+import gradio as gr
+import httpx
+import pandas as pd
 import typer
 import uvicorn
-import webbrowser
-import time
-from pathlib import Path
-
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import Response, StreamingResponse
+from loguru import logger
+from sqlalchemy.engine import Engine  # 导入同步 Engine
 # --- 导入 SQLModel 和同步组件 ---
 # 切换到同步 Session 和 Engine
 from sqlmodel import Field, SQLModel, create_engine, Session, select
-from sqlalchemy.engine import Engine  # 导入同步 Engine
+from starlette.concurrency import run_in_threadpool
 
 BASE_DIR = Path(__file__).absolute().parent.parent.parent
 SQLITE_DB_DIR = BASE_DIR / "data"  # 确保 data 目录存在
@@ -30,9 +28,9 @@ SQLITE_DB_FILE = str(SQLITE_DB_DIR / "routes.db")
 SQLITE_URL = f"sqlite:///{SQLITE_DB_FILE}"
 
 # --- 全局变量 ---
-client: httpx.AsyncClient = None
+client: Optional[httpx.AsyncClient] = None
 # 同步 Engine
-engine: Engine = None
+engine: Optional[Engine] = None
 
 # 1. 存储每个 model_name 的下一个索引
 #    defaultdict(int) 会在键不存在时自动创建并赋值为 0
@@ -60,6 +58,16 @@ class ModelRoute(SQLModel, table=True):
         default_factory=lambda: datetime.now(timezone.utc), nullable=False
     )
 
+class DefaultRoute(SQLModel, table=True):
+    """
+    a SQLModel for staring default model of route
+    """
+    route: Literal["/v1/completions", '/v1/chat/completions', "/v1/embeddings",
+                   "/v1/images/generations", "/v1/images/edits", "/v1/images/variations",
+                   "/v1/audio/transcriptions","/v1/audio/translations", "/v1/rerank",
+                   '/tokenize', '/detokenize'] = Field(primary_key=True)
+    default_model: str
+
 
 # --- 同步数据库辅助函数 (将在线程池中执行) ---
 
@@ -69,7 +77,7 @@ def create_db_and_tables_sync():
     SQLModel.metadata.create_all(engine)
 
 
-def get_all_model_names_sync():
+def get_all_model_names_sync() -> Sequence[str]:
     """同步地从数据库中查询所有可用的模型名称"""
     with Session(engine) as session:
         statement = select(ModelRoute.model_name)
@@ -78,7 +86,7 @@ def get_all_model_names_sync():
     return available_models
 
 
-def get_all_routes_sync():
+def get_all_routes_sync() -> Sequence[ModelRoute]:
     """同步地从数据库中查询所有可用的 ModelRoute 记录"""
     with Session(engine) as session:
         # 查询 ModelRoute 的所有记录
@@ -89,7 +97,7 @@ def get_all_routes_sync():
     return all_routes
 
 
-def get_routing_info_sync(model: str):
+def get_routing_info_sync(model: str) -> tuple[Optional[str], Sequence[str], Optional[str]]:
     """同步地从数据库中查询模型和所有可用模型"""
     with Session(engine) as session:
         # <--- MODIFIED: 核心负载均衡逻辑 --->
@@ -97,7 +105,7 @@ def get_routing_info_sync(model: str):
         # 1. 获取 *所有* 匹配该模型的路由
         statement = select(ModelRoute).where(ModelRoute.model_name == model)
         # .all() 将所有匹配的路由加载到列表中
-        db_routes_list = session.exec(statement).all()
+        db_routes_list: Sequence[ModelRoute] = session.exec(statement).all()
 
         # 2. 获取所有可用模型名称 (用于错误消息)
         available_models = get_all_model_names_sync()
@@ -140,6 +148,16 @@ def get_routing_info_sync(model: str):
 
         return server, available_models, backend_api_key
 
+def get_default_model_route_info_sync(path: str) -> tuple[Optional[str], Sequence[str], Optional[str]]:
+    """同步地从数据库中查询默认模型路由信息"""
+    with Session(engine) as session:
+        statement = select(DefaultRoute).where(DefaultRoute.route == path)
+        route = session.exec(statement).first()
+
+        if route:
+            return get_routing_info_sync(route.default_model)
+        else:
+            return None, get_all_model_names_sync(), None
 
 # --- FastAPI 生命周期 ---
 
@@ -149,7 +167,7 @@ from sqlalchemy.exc import OperationalError, DBAPIError
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_: FastAPI):
     global client, engine
 
     # --- 启动时的逻辑 ---
@@ -242,21 +260,28 @@ async def _get_routing_info(request: Request):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     model = json_body.get("model")
+
     if model is None:
-        raise HTTPException(
-            status_code=400, detail="'model' field is required in request body"
+        server, available_models, backend_api_key = await run_in_threadpool(
+            get_default_model_route_info_sync, request.url.path
         )
 
-    # 在线程池中执行同步查询
-    server, available_models, backend_api_key = await run_in_threadpool(
-        get_routing_info_sync, model
-    )
-
-    if server is None:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid model: {model}. Available models: {available_models}",
+        if server is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Can't find default model for path {request.url.path}. Available models: {available_models}",
+            )
+    else:
+        # 在线程池中执行同步查询
+        server, available_models, backend_api_key = await run_in_threadpool(
+            get_routing_info_sync, model
         )
+
+        if server is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid model: {model}. Available models: {available_models}",
+            )
 
     backend_url = server + request.url.path
     logger.info(f"Routing to backend_url: {backend_url} for model {model}")
@@ -319,8 +344,8 @@ async def _non_stream_proxy(
     if backend_api_key:
         headers["Authorization"] = f"Bearer {backend_api_key}"
     try:
-        response = await client.post(
-            backend_url, params=request.query_params, json=json_body, headers=headers
+        response = await client.request(
+            request.method, backend_url, params=request.query_params, json=json_body, headers=headers
         )
         return Response(
             content=response.content,
@@ -348,7 +373,7 @@ async def list_models():
     try:
 
         # 1. 获取所有路由条目
-        all_routes: list[ModelRoute] = await run_in_threadpool(get_all_routes_sync)
+        all_routes: Sequence[ModelRoute] = await run_in_threadpool(get_all_routes_sync)
 
         # 2. 按 model_name 分组，并找到每组中 *最早* 的 created 时间戳
         models_by_name = {}  # { model_name: earliest_timestamp }
@@ -391,17 +416,17 @@ async def list_models():
         )
 
 
-@app.post("/v1/responses", summary="/v1/responses ")
 @app.post("/v1/completions", summary="/v1/completions")
 @app.post("/v1/chat/completions", summary="/v1/chat/completions")
 @app.post("/v1/embeddings", summary="/v1/embeddings")
-@app.post("/v1/moderations", summary="/v1/moderations")
 @app.post("/v1/images/generations", summary="/v1/images/generations")
 @app.post("/v1/images/edits", summary="/v1/images/edits")
 @app.post("/v1/images/variations", summary="/v1/images/variations")
 @app.post("/v1/audio/transcriptions", summary="/v1/audio/transcriptions")
-@app.post("/v1/audio/speech", summary="/v1/audio/speech")
+@app.post("/v1/audio/translations", summary="/v1/audio/translations")
 @app.post("/v1/rerank", summary="/v1/rerank")
+@app.post('/tokenize', summary='/tokenize')
+@app.post('/detokenize', summary='/detokenize')
 async def router(request: Request):
     backend_url, json_body, backend_api_key = await _get_routing_info(request)
     if json_body.get("stream", False):
@@ -416,16 +441,16 @@ async def router(request: Request):
 # --- Gradio 管理界面逻辑 (同步数据库操作) ---
 
 
-def get_current_routes_sync():
+def get_current_routes_sync() -> list[tuple[str, str, str]]:
     """同步获取当前路由表"""
     with Session(engine) as session:
         statement = select(ModelRoute)
         routes_db = session.exec(statement)
-        routes = []
+        routes: list[tuple[str, str, str]] = []
         for route in routes_db.all():
             # 屏蔽 API 密钥，仅显示最后 4 位
             masked_key = f"***{route.api_key[-4:]}" if route.api_key else "N/A (将透传)"
-            routes.append([route.model_name, route.model_url, masked_key])
+            routes.append((route.model_name, route.model_url, masked_key))
     return routes
 
 
@@ -624,15 +649,8 @@ def main(
     ] = 8000,
 ):
     base_url = f"http://{host}:{port}"
-    logger.info(f"UI 界面: http://{host}:{port}")
-    logger.info(f"openAI API 文档: http://{host}:{port}/docs")
-    time.sleep(1)
-    try:
-        if "0.0.0.0" in base_url:
-            base_url = f"http://localhost:{port}"
-        webbrowser.open_new_tab(base_url)
-    except Exception as e:
-        logger.warning(f"无法自动打开浏览器: {e}")
+    logger.info(f"UI 界面: {base_url}")
+    logger.info(f"openAI API 文档: {base_url}/docs")
     uvicorn.run(app, host=host, port=port)
 
 
